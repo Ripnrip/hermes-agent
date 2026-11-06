@@ -309,17 +309,31 @@ def _is_supervised_gateway_process() -> bool:
     """Whether this process is the live, supervised Hermes gateway itself.
     Supervisor markers and ``_HERMES_GATEWAY`` are inherited by every descendant (and
     importing ``gateway.run`` sets the latter), so also require ownership of the live
-    gateway PID file — scopes are for the gateway, not terminal children or CLIs.
+    gateway — scopes are for the gateway, not terminal children or CLIs.
     Reads the launch marker (``HERMES_SUPERVISED_CHILD`` included), not the restart-route
     probe: a Windows Scheduled-Task gateway sets only that marker, and the self-kill guards
-    gated here must protect it too (#113667)."""
+    gated here must protect it too (#113667).
+
+    Hot path (HAB-1416 / #111922): once this process holds the gateway runtime lock it
+    *is* the gateway. Prefer that in-memory ownership check over ``get_running_pid`` —
+    the latter ends in ``psutil`` ``create_time`` / ``process_birth``, which has wedged
+    for minutes on macOS and made every ``terminal`` / ``execute_code`` pre-exec guard
+    time out fail-closed ("process-identity probe wedged"). Descendants that only
+    inherited the env marker still fall through to the PID-file match.
+    """
     if os.environ.get("_HERMES_GATEWAY") != "1":
         return False
     try:
         from gateway.restart import is_supervised_gateway_launch
-        from gateway.status import get_running_pid
+        from gateway.status import get_running_pid, owns_gateway_runtime_lock
 
-        return is_supervised_gateway_launch() and get_running_pid(cleanup_stale=False) == os.getpid()
+        if not is_supervised_gateway_launch():
+            return False
+        # In-process lock ownership is authoritative and lock-free aside from a dict
+        # lookup — no kernel process query, no flock probe of our own lock file.
+        if owns_gateway_runtime_lock():
+            return True
+        return get_running_pid(cleanup_stale=False) == os.getpid()
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
         return False
