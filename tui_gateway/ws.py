@@ -136,6 +136,16 @@ try:
 except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
+# WebSocketDisconnected (not a WebSocketDisconnect subclass) is raised by receive_text()/send() when
+# application_state is already past CONNECTED — a send failure on this peer flips that state, and the
+# next receive_text() hits this guard instead of a normal close frame. Same meaning as a client
+# disconnect; without this it fell through to the generic `except Exception` below and logged a full
+# traceback for what is operationally identical to the handled case right above it.
+try:
+    from starlette.websockets import WebSocketDisconnected as _WebSocketDisconnected
+except ImportError:  # pragma: no cover - starlette is a required install path
+    _WebSocketDisconnected = Exception  # type: ignore[assignment]
+
 
 class WSTransport:
     """Per-connection WS transport. ``write`` is safe from any thread *other than* the loop thread owning the
@@ -689,6 +699,12 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 raise
             except _WebSocketDisconnect as exc:
                 disconnect_reason = f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
+                break
+            except _WebSocketDisconnected:
+                # The connection's application_state already moved past CONNECTED (typically a prior
+                # send failure on this same peer) — same outcome as the clean disconnect above, just
+                # signaled a different way. No close code/reason available here, unlike the branch above.
+                disconnect_reason = "client_disconnect(already_disconnected)"
                 break
             except Exception:
                 disconnect_reason = "receive_failed"

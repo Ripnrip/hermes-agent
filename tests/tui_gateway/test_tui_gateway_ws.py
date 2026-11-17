@@ -86,6 +86,39 @@ def test_ws_disconnect_reaps_flagged_session_and_closes_worker(monkeypatch):
 
 
 
+def test_ws_already_disconnected_logs_as_clean_disconnect_not_receive_failed(monkeypatch, caplog):
+    """WebSocketDisconnected (application_state already past CONNECTED, e.g. after a prior send
+    failure on this peer) is not a WebSocketDisconnect subclass. Regression for a bug where it fell
+    through to the generic `except Exception`: session teardown still ran either way (that's the
+    shared `finally` path, not what distinguishes the branches), but the closing summary line logged
+    reason="receive_failed" via `_log.exception` (full traceback) instead of the clean
+    reason="client_disconnect(already_disconnected)" an expected disconnect should get."""
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+    monkeypatch.setattr(server, "_finalize_session", lambda s, end_reason="tui_close": None)
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            pass
+
+        async def receive_text(self):
+            raise ws_mod._WebSocketDisconnected("WebSocket is not connected.")
+
+        async def close(self):
+            pass
+
+    with caplog.at_level("INFO", logger="tui_gateway.ws"):
+        asyncio.run(ws_mod.handle_ws(FakeWS()))  # must not raise either way
+
+    closed_lines = [r.getMessage() for r in caplog.records if r.message.startswith("ws closed peer=")]
+    assert len(closed_lines) == 1
+    assert "reason=client_disconnect(already_disconnected)" in closed_lines[0]
+    assert "reason=receive_failed" not in closed_lines[0]
+    assert not any(r.levelname in ("ERROR", "CRITICAL") for r in caplog.records)
+
+
 def test_ws_connection_registers_then_disconnect_unregisters_live_transport(monkeypatch):
     """A connected client must be tracked in the live-transport registry so a
     session-less global broadcast (skin.changed from the background watcher)
